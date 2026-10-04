@@ -1,0 +1,19 @@
+services:
+  zeit-tracker:
+    container_name: zeit-niklasfritsch
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:  # reverse proxy connects to host port 8321
+      - "8321:3000"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - default
+      - gate-app
+
+networks:
+  gate-app:
+    external: true
+    name: gate--app_net
