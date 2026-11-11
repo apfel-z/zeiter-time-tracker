@@ -1,7 +1,5 @@
 # zeiter (zeit.niklasfritsch.de)
 
-Minimalistisches Web-Time-Tracking-Tool nach den Designprinzipien von **Dieter Rams (Braun)** und der funktionalen Einfachheit des **Lemon Timetrackers**.
-
 ## Features
 - **Keine Datenbank nötig (Zero-Backend)**: Alle Einträge, Projekte, Tags und Filter werden lokal im Browser (`localStorage`) gespeichert.
 - **Portabilität (Gerätewechsel)**: Vollständiger **JSON-Export & Import** direkt im Header sowie **CSV-Export** für Buchhaltung und Excel.
