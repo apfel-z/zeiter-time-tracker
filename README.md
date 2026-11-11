@@ -1,4 +1,4 @@
-# ZEIT // Niklas Fritsch (zeit.niklasfritsch.de)
+# zeiter (zeit.niklasfritsch.de)
 
 Minimalistisches Web-Time-Tracking-Tool nach den Designprinzipien von **Dieter Rams (Braun)** und der funktionalen Einfachheit des **Lemon Timetrackers**.
 
