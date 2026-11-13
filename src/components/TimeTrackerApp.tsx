@@ -19,23 +19,35 @@ import {
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  FileText,
+  User,
+  AlertTriangle,
+  X,
 } from "lucide-react";
 import {
   AppData,
+  EMPTY_DATA,
   INITIAL_DATA,
   PASTEL_PALETTE,
   Project,
+  SavedFilter,
   TimeRecord,
+  getRandomPastelSwatch,
 } from "@/lib/defaultData";
 import {
+  REPORT_RANGES,
+  computeKpiStats,
+  formatDecimalHours,
+  formatGermanDateHeader,
   formatHM,
   formatHMS,
-  formatDecimalHours,
-  parseDurationString,
-  formatGermanDateHeader,
   formatShortDate,
+  getReportRangeLabel,
   getTodayISO,
+  matchesReportRange,
+  parseDurationString,
 } from "@/lib/timeUtils";
+import { exportReportAsPDF } from "@/lib/pdfExport";
 
 const STORAGE_KEY = "zeit_niklasfritsch_v2";
 
@@ -50,18 +62,25 @@ export default function TimeTrackerApp() {
   const [selectedProjectId, setSelectedProjectId] = useState<string>("p1");
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [showAllSuggestions, setShowAllSuggestions] = useState(true);
+  const [showKpiAverages, setShowKpiAverages] = useState(false);
   const [editingDurationId, setEditingDurationId] = useState<string | null>(null);
   const [editingDurationValue, setEditingDurationValue] = useState<string>("");
 
+  // Multi-tag popover state for daily record rows
+  const [openTagMenuRecordId, setOpenTagMenuRecordId] = useState<string | null>(null);
+  const [inlineNewTagValue, setInlineNewTagValue] = useState<string>("");
+
   // Reports states
-  const [reportRange, setReportRange] = useState<string>("all");
+  const [reportRange, setReportRange] = useState<string>("all_time");
   const [reportProjectId, setReportProjectId] = useState<string>("all");
   const [reportTag, setReportTag] = useState<string>("all");
+  const [customFilterName, setCustomFilterName] = useState<string>("");
 
   // Settings states
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectColorIdx, setNewProjectColorIdx] = useState(0);
   const [newTagName, setNewTagName] = useState("");
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Load from localStorage on client mount
@@ -71,7 +90,22 @@ export default function TimeTrackerApp() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.projects) && Array.isArray(parsed.records)) {
-          setData(parsed);
+          // Migrate legacy "Demo User" / "Example Team" if untouched
+          const migratedUser =
+            parsed.user === "Demo User" ? INITIAL_DATA.user : (parsed.user ?? INITIAL_DATA.user);
+          const migratedTeam =
+            parsed.team === "Example Team" ? INITIAL_DATA.team : (parsed.team ?? INITIAL_DATA.team);
+
+          setData({
+            ...INITIAL_DATA,
+            ...parsed,
+            user: migratedUser,
+            team: migratedTeam,
+            tags: Array.isArray(parsed.tags) ? parsed.tags : INITIAL_DATA.tags,
+            savedFilters: Array.isArray(parsed.savedFilters)
+              ? parsed.savedFilters
+              : INITIAL_DATA.savedFilters,
+          });
           if (parsed.projects[0]) {
             setSelectedProjectId(parsed.projects[0].id);
           }
@@ -135,25 +169,79 @@ export default function TimeTrackerApp() {
     const lastToken = tokens[tokens.length - 1];
     if (!lastToken || lastToken.length < 1) return [];
 
-    const query = lastToken.replace(/^[@#]/, "").toLowerCase();
-    if (!query) return [];
+    const isExplicitProject = lastToken.startsWith("@");
+    const isExplicitTag = lastToken.startsWith("#");
+    const query = lastToken.replace(/^[@#]/, "").trim();
+    const queryLower = query.toLowerCase();
+    if (!queryLower) return [];
 
-    const matchingProjects = data.projects
-      .filter((p) => p.name.toLowerCase().includes(query))
-      .map((p) => ({ type: "project" as const, label: p.name, project: p }));
+    const matchingProjects = isExplicitTag
+      ? []
+      : data.projects
+          .filter((p) => p.name.toLowerCase().includes(queryLower))
+          .map((p) => ({
+            type: "project" as const,
+            label: p.name,
+            project: p,
+            isNew: false,
+          }));
 
-    const matchingTags = data.tags
-      .filter((t) => t.toLowerCase().includes(query))
-      .map((t) => ({ type: "tag" as const, label: t }));
+    // If user typed @projekttest and it does not exist yet, offer creating it with random color
+    const exactProjectExists = data.projects.some(
+      (p) => p.name.toLowerCase() === queryLower
+    );
+    const createProjectItem =
+      isExplicitProject && !exactProjectExists
+        ? [
+            {
+              type: "project" as const,
+              label: query,
+              project: undefined,
+              isNew: true,
+            },
+          ]
+        : [];
 
-    return [...matchingProjects, ...matchingTags].slice(0, 6);
+    const matchingTags = isExplicitProject
+      ? []
+      : data.tags
+          .filter((t) => t.toLowerCase().includes(queryLower))
+          .map((t) => ({
+            type: "tag" as const,
+            label: t,
+            project: undefined,
+            isNew: false,
+          }));
+
+    return [...matchingProjects, ...createProjectItem, ...matchingTags].slice(0, 7);
   }, [commandInput, data.projects, data.tags]);
 
-  const applyAutocomplete = (item: { type: "project" | "tag"; label: string; project?: Project }) => {
+  const applyAutocomplete = (item: {
+    type: "project" | "tag";
+    label: string;
+    project?: Project;
+    isNew?: boolean;
+  }) => {
     const tokens = commandInput.trim().split(/\s+/);
     tokens.pop();
-    if (item.type === "project" && item.project) {
-      setSelectedProjectId(item.project.id);
+    if (item.type === "project") {
+      if (item.project) {
+        setSelectedProjectId(item.project.id);
+      } else if (item.isNew && item.label) {
+        // Create new project with random pastel color right away
+        const swatch = getRandomPastelSwatch(data.projects);
+        const newProj: Project = {
+          id: `p_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+          name: item.label,
+          color: swatch.color,
+          textColor: swatch.textColor,
+        };
+        setData((prev) => ({
+          ...prev,
+          projects: [...prev.projects, newProj],
+        }));
+        setSelectedProjectId(newProj.id);
+      }
     } else if (item.type === "tag") {
       if (!selectedTags.includes(item.label)) {
         setSelectedTags((prev) => [...prev, item.label]);
@@ -162,34 +250,55 @@ export default function TimeTrackerApp() {
     setCommandInput(tokens.length > 0 ? tokens.join(" ") + " " : "");
   };
 
-  // Parse command input & start or log record
+  // Parse command input & start or log record (auto-creating @newproject if it doesn't exist)
   const handleCommandSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    let projId = selectedProjectId || data.projects[0]?.id || "p1";
+    let projId = selectedProjectId || data.projects[0]?.id || "";
     const tags = [...selectedTags];
     let durationSec: number | null = null;
     let dateStr = getTodayISO();
     const descWords: string[] = [];
 
     const tokens = commandInput.trim().split(/\s+/).filter(Boolean);
+    const newlyCreatedProjects: Project[] = [];
+    const newlyCreatedTags: string[] = [];
 
     for (const token of tokens) {
       if (token.startsWith("@")) {
-        const pName = token.slice(1).toLowerCase();
-        const found = data.projects.find(
-          (p) => p.name.toLowerCase() === pName || p.name.toLowerCase().includes(pName)
-        );
-        if (found) {
-          projId = found.id;
+        const rawProjName = token.slice(1).trim();
+        if (rawProjName) {
+          const allKnownProjects = [...data.projects, ...newlyCreatedProjects];
+          const exactMatch = allKnownProjects.find(
+            (p) => p.name.toLowerCase() === rawProjName.toLowerCase()
+          );
+          if (exactMatch) {
+            projId = exactMatch.id;
+          } else {
+            // Auto-create project with a random pastel color
+            const swatch = getRandomPastelSwatch(allKnownProjects);
+            const createdProj: Project = {
+              id: `p_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+              name: rawProjName,
+              color: swatch.color,
+              textColor: swatch.textColor,
+            };
+            newlyCreatedProjects.push(createdProj);
+            projId = createdProj.id;
+          }
           continue;
         }
       }
       if (token.startsWith("#")) {
-        const tName = token.slice(1);
-        if (tName && !tags.includes(tName)) {
-          tags.push(tName);
+        const tName = token.slice(1).trim();
+        if (tName) {
+          if (!tags.includes(tName)) {
+            tags.push(tName);
+          }
+          if (!data.tags.includes(tName) && !newlyCreatedTags.includes(tName)) {
+            newlyCreatedTags.push(tName);
+          }
+          continue;
         }
-        continue;
       }
       const parsedDur = parseDurationString(token);
       if (parsedDur !== null) {
@@ -209,6 +318,27 @@ export default function TimeTrackerApp() {
     const shouldRunImmediately = durationSec === null;
 
     setData((prev) => {
+      const mergedProjects = [...prev.projects, ...newlyCreatedProjects];
+      const mergedTags = [...prev.tags, ...newlyCreatedTags];
+
+      // Ensure we always have at least one valid project
+      let effectiveProjectId = projId;
+      if (!effectiveProjectId || !mergedProjects.some((p) => p.id === effectiveProjectId)) {
+        if (mergedProjects.length > 0) {
+          effectiveProjectId = mergedProjects[0].id;
+        } else {
+          const fallbackSwatch = getRandomPastelSwatch([]);
+          const defaultProj: Project = {
+            id: `p_${Date.now()}`,
+            name: "Allgemein",
+            color: fallbackSwatch.color,
+            textColor: fallbackSwatch.textColor,
+          };
+          mergedProjects.push(defaultProj);
+          effectiveProjectId = defaultProj.id;
+        }
+      }
+
       // Stop any running timers if we start a new running timer
       const updatedRecords = prev.records.map((r) => {
         if (shouldRunImmediately && r.isRunning && r.startedAt) {
@@ -221,7 +351,7 @@ export default function TimeTrackerApp() {
       const newRecord: TimeRecord = {
         id: `rec_${Date.now()}`,
         date: dateStr,
-        projectId: projId,
+        projectId: effectiveProjectId,
         tags,
         description: finalDescription,
         seconds: durationSec ?? 0,
@@ -231,10 +361,15 @@ export default function TimeTrackerApp() {
 
       return {
         ...prev,
+        projects: mergedProjects,
+        tags: mergedTags,
         records: [newRecord, ...updatedRecords],
       };
     });
 
+    if (newlyCreatedProjects.length > 0) {
+      setSelectedProjectId(newlyCreatedProjects[newlyCreatedProjects.length - 1].id);
+    }
     setCommandInput("");
     setSelectedTags([]);
   };
@@ -270,6 +405,31 @@ export default function TimeTrackerApp() {
     }));
   };
 
+  const toggleTagOnRecord = (recordId: string, tag: string) => {
+    updateRecordField(recordId, (r) => {
+      const exists = r.tags.includes(tag);
+      return {
+        ...r,
+        tags: exists ? r.tags.filter((t) => t !== tag) : [...r.tags, tag],
+      };
+    });
+  };
+
+  const addNewTagToRecord = (recordId: string, rawTag: string) => {
+    const clean = rawTag.trim().replace(/^#/, "");
+    if (!clean) return;
+    setData((prev) => ({
+      ...prev,
+      tags: prev.tags.includes(clean) ? prev.tags : [...prev.tags, clean],
+      records: prev.records.map((r) =>
+        r.id === recordId
+          ? { ...r, tags: r.tags.includes(clean) ? r.tags : [...r.tags, clean] }
+          : r
+      ),
+    }));
+    setInlineNewTagValue("");
+  };
+
   const deleteRecord = (recordId: string) => {
     setData((prev) => ({
       ...prev,
@@ -288,6 +448,12 @@ export default function TimeTrackerApp() {
     }
     return Array.from(map.entries());
   }, [data.records]);
+
+  // Dynamic KPI strip calculations (Current Week, Last Week, Current Month, Last Month + Averages)
+  const kpiStats = useMemo(
+    () => computeKpiStats(data.records, getLiveSeconds, new Date(now)),
+    [data.records, now]
+  );
 
   // Export JSON backup
   const handleExportJSON = () => {
@@ -322,16 +488,50 @@ export default function TimeTrackerApp() {
     e.target.value = "";
   };
 
+  // Save current report filter combination
+  const handleSaveCurrentFilter = () => {
+    const rangeLabel = getReportRangeLabel(reportRange);
+    const projLabel =
+      reportProjectId === "all"
+        ? "Alle Projekte"
+        : data.projects.find((p) => p.id === reportProjectId)?.name || reportProjectId;
+    const tagLabel = reportTag === "all" ? "Alle Tags" : `#${reportTag}`;
+
+    const autoName = `${rangeLabel} • ${projLabel} • ${tagLabel}`;
+    const finalName = customFilterName.trim() || autoName;
+
+    const newFilter: SavedFilter = {
+      id: `sf_${Date.now()}`,
+      name: finalName,
+      range: reportRange,
+      projectId: reportProjectId,
+      tag: reportTag,
+    };
+
+    setData((prev) => ({
+      ...prev,
+      savedFilters: [...prev.savedFilters, newFilter],
+    }));
+    setCustomFilterName("");
+  };
+
+  const handleDeleteSavedFilter = (filterId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setData((prev) => ({
+      ...prev,
+      savedFilters: prev.savedFilters.filter((sf) => sf.id !== filterId),
+    }));
+  };
+
   // Filtered records for Reports
   const filteredReportRecords = useMemo(() => {
     return data.records.filter((r) => {
       if (reportProjectId !== "all" && r.projectId !== reportProjectId) return false;
       if (reportTag !== "all" && !r.tags.includes(reportTag)) return false;
-      if (reportRange === "today" && r.date !== getTodayISO()) return false;
-      if (reportRange === "nov2026" && !r.date.startsWith("2026-11")) return false;
+      if (!matchesReportRange(r.date, reportRange, new Date(now))) return false;
       return true;
     });
-  }, [data.records, reportProjectId, reportTag, reportRange]);
+  }, [data.records, reportProjectId, reportTag, reportRange, now]);
 
   const totalReportSeconds = useMemo(
     () => filteredReportRecords.reduce((acc, r) => acc + getLiveSeconds(r), 0),
@@ -355,10 +555,10 @@ export default function TimeTrackerApp() {
       const sec = getLiveSeconds(r);
       return [
         formatShortDate(r.date),
-        data.team,
-        data.user,
+        data.team || "",
+        data.user || "",
         proj,
-        r.tags.join(", "),
+        r.tags.map((t) => `#${t}`).join(", "),
         `"${(r.description || "").replace(/"/g, '""')}"`,
         formatHM(sec),
         formatDecimalHours(sec),
@@ -372,6 +572,19 @@ export default function TimeTrackerApp() {
     a.download = `zeit-report-${getTodayISO()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  // PDF Export for Reports (styled like the website)
+  const handleExportPDF = () => {
+    exportReportAsPDF({
+      data,
+      records: filteredReportRecords,
+      getLiveSeconds,
+      reportRange,
+      reportProjectId,
+      reportTag,
+      totalSeconds: totalReportSeconds,
+    });
   };
 
   // Statistics aggregations
@@ -431,15 +644,10 @@ export default function TimeTrackerApp() {
     return result.sort((a, b) => b.seconds - a.seconds);
   }, [data.records, now]);
 
-  const totalTrackedSeconds = useMemo(
-    () => data.records.reduce((acc, r) => acc + getLiveSeconds(r), 0),
-    [data.records, now]
-  );
-
   if (!hydrated) {
     return (
       <div className="min-h-screen bg-[#F4F1EA] flex items-center justify-center font-mono text-xs uppercase tracking-widest">
-        INITIALISIERE ZEIT // NIKLAS FRITSCH ...
+        INITIALISIERE ZEIT ...
       </div>
     );
   }
@@ -449,12 +657,10 @@ export default function TimeTrackerApp() {
       {/* DIETER RAMS TOP HARDWARE HEADER */}
       <header className="sticky top-0 z-30 bg-[#FAF8F5] border-b border-[#191918]">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          {/* Brand mark and domain */}
+          {/* Brand mark */}
           <div className="flex items-center gap-3">
             <div className="w-3.5 h-3.5 rounded-full bg-[#E04F26] border border-[#191918]" />
-            <span className="hidden sm:inline-block font-mono text-[11px] uppercase tracking-widest text-[#6E6D68]">
-              // niklasfritsch.de
-            </span>
+            <span className="font-bold tracking-tight text-lg">ZEIT</span>
           </div>
 
           {/* Navigation Tabs */}
@@ -536,11 +742,11 @@ export default function TimeTrackerApp() {
                     type="text"
                     value={commandInput}
                     onChange={(e) => setCommandInput(e.target.value)}
-                    placeholder="@Projekt #Tag Deine Beschreibung 1:42 (oder leer lassen für Live-Timer)"
+                    placeholder="@Projekt #Tag1 #Tag2 Deine Beschreibung 1:42 (neue @Projekte werden automatisch angelegt)"
                     className="w-full h-12 px-4 bg-[#F4F1EA] border border-[#191918] font-mono text-sm placeholder:text-[#6E6D68] focus:outline-none focus:bg-white"
                   />
 
-                  {/* Autocomplete Dropdown (wie im Lemon Screenshot) */}
+                  {/* Autocomplete Dropdown */}
                   {autocompleteItems.length > 0 && (
                     <div className="absolute left-0 right-0 top-full mt-1 bg-[#FAF8F5] border border-[#191918] z-20 shadow-sm">
                       {autocompleteItems.map((item, idx) => (
@@ -553,8 +759,13 @@ export default function TimeTrackerApp() {
                           <span>
                             {item.type === "project" ? "@" : "#"}
                             <strong>{item.label}</strong>
+                            {item.isNew && (
+                              <span className="ml-2 text-[11px] opacity-75">
+                                (Neu anlegen mit Zufallsfarbe)
+                              </span>
+                            )}
                           </span>
-                          {item.type === "project" && (
+                          {item.type === "project" && item.project && (
                             <span
                               className="px-2 py-0.5 text-[10px] border border-[#191918]"
                               style={{
@@ -563,6 +774,11 @@ export default function TimeTrackerApp() {
                               }}
                             >
                               PROJEKT
+                            </span>
+                          )}
+                          {item.type === "project" && item.isNew && (
+                            <span className="px-2 py-0.5 text-[10px] border border-[#191918] bg-[#E04F26] text-white">
+                              + NEU
                             </span>
                           )}
                         </button>
@@ -580,7 +796,7 @@ export default function TimeTrackerApp() {
                 </button>
               </form>
 
-              {/* Suggestions Drawer: Clickable Vibrant Pastel Projects & Tags */}
+              {/* Suggestions Drawer: Clickable Vibrant Pastel Projects & Multi-Tags */}
               <div className="space-y-3 pt-2 border-t border-[#D8D3C8]">
                 <div className="flex items-center justify-between">
                   <span className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
@@ -619,7 +835,9 @@ export default function TimeTrackerApp() {
                               color: proj.textColor,
                             }}
                             className={`px-3 py-1.5 text-xs font-medium border border-[#191918] transition-transform flex items-center gap-1.5 ${
-                              isSelected ? "ring-2 ring-[#191918] ring-offset-2 ring-offset-[#FAF8F5] font-bold" : "opacity-85 hover:opacity-100"
+                              isSelected
+                                ? "ring-2 ring-[#191918] ring-offset-2 ring-offset-[#FAF8F5] font-bold"
+                                : "opacity-85 hover:opacity-100"
                             }`}
                           >
                             {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
@@ -629,7 +847,7 @@ export default function TimeTrackerApp() {
                       })}
                     </div>
 
-                    {/* Tag Pills */}
+                    {/* Multi-Tag Pills */}
                     <div className="flex flex-wrap gap-1.5 pt-1">
                       {data.tags.map((tag) => {
                         const active = selectedTags.includes(tag);
@@ -639,16 +857,18 @@ export default function TimeTrackerApp() {
                             type="button"
                             onClick={() =>
                               setSelectedTags((prev) =>
-                                prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+                                prev.includes(tag)
+                                  ? prev.filter((t) => t !== tag)
+                                  : [...prev, tag]
                               )
                             }
-                            className={`px-2.5 py-1 text-xs font-mono border border-[#191918] transition-colors ${
+                            className={`px-2.5 py-1 text-xs font-mono border border-[#191918] transition-colors flex items-center gap-1 ${
                               active
                                 ? "bg-[#191918] text-[#FAF8F5]"
                                 : "bg-[#F4F1EA] text-[#191918] hover:bg-[#EAE5DC]"
                             }`}
                           >
-                            #{tag}
+                            {active && <Check className="w-3 h-3" />}#{tag}
                           </button>
                         );
                       })}
@@ -658,160 +878,304 @@ export default function TimeTrackerApp() {
               </div>
             </div>
 
-            {/* Summary KPI Strip (Current Week / Last Week / Current Month / Total) */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 border border-[#191918] bg-[#FAF8F5] divide-y sm:divide-y-0 sm:divide-x divide-[#191918]">
-              <div className="p-4 text-center">
-                <div className="font-mono text-xl font-bold">{formatHM(totalTrackedSeconds)}h</div>
-                <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
-                  Aktuelle Auswahl
+            {/* Summary KPI Strip (Dynamic + Collapsible Daily Averages like LemonTime) */}
+            <div className="border border-[#191918] bg-[#FAF8F5]">
+              <div
+                onClick={() => setShowKpiAverages((prev) => !prev)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setShowKpiAverages((prev) => !prev);
+                  }
+                }}
+                title="Klicken, um Tagesdurchschnitte ein-/auszuklappen"
+                className="grid grid-cols-2 sm:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-[#191918] cursor-pointer hover:bg-[#F4F1EA]/60 transition-colors"
+              >
+                {/* Current Week */}
+                <div className="p-4 text-center space-y-1">
+                  <div className="font-mono text-xl font-bold">
+                    {formatHM(kpiStats.currentWeekSeconds)}h
+                  </div>
+                  <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
+                    Aktuelle Woche
+                  </div>
+                  {showKpiAverages && (
+                    <div className="pt-2 mt-2 border-t border-[#D8D3C8] font-mono text-[11px] text-[#6E6D68] space-y-0.5">
+                      <div>
+                        ø <strong className="text-[#191918]">{formatHM(kpiStats.currentWeekAvgExclToday)}h</strong> excluding today
+                      </div>
+                      <div>
+                        ø <strong className="text-[#191918]">{formatHM(kpiStats.currentWeekAvgInclToday)}h</strong> including today
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Last Week */}
+                <div className="p-4 text-center space-y-1">
+                  <div className="font-mono text-xl font-bold">
+                    {formatHM(kpiStats.lastWeekSeconds)}h
+                  </div>
+                  <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
+                    Letzte Woche
+                  </div>
+                  {showKpiAverages && (
+                    <div className="pt-2 mt-2 border-t border-[#D8D3C8] font-mono text-[11px] text-[#6E6D68]">
+                      ø <strong className="text-[#191918]">{formatHM(kpiStats.lastWeekAvg)}h</strong>
+                    </div>
+                  )}
+                </div>
+
+                {/* Current Month */}
+                <div className="p-4 text-center space-y-1">
+                  <div className="font-mono text-xl font-bold">
+                    {formatHM(kpiStats.currentMonthSeconds)}h
+                  </div>
+                  <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
+                    Aktueller Monat
+                  </div>
+                  {showKpiAverages && (
+                    <div className="pt-2 mt-2 border-t border-[#D8D3C8] font-mono text-[11px] text-[#6E6D68] space-y-0.5">
+                      <div>
+                        ø <strong className="text-[#191918]">{formatHM(kpiStats.currentMonthAvgExclToday)}h</strong> excluding today
+                      </div>
+                      <div>
+                        ø <strong className="text-[#191918]">{formatHM(kpiStats.currentMonthAvgInclToday)}h</strong> including today
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Last Month */}
+                <div className="p-4 text-center space-y-1">
+                  <div className="font-mono text-xl font-bold">
+                    {formatHM(kpiStats.lastMonthSeconds)}h
+                  </div>
+                  <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
+                    Letzter Monat
+                  </div>
+                  {showKpiAverages && (
+                    <div className="pt-2 mt-2 border-t border-[#D8D3C8] font-mono text-[11px] text-[#6E6D68]">
+                      ø <strong className="text-[#191918]">{formatHM(kpiStats.lastMonthAvg)}h</strong>
+                    </div>
+                  )}
                 </div>
               </div>
-              <div className="p-4 text-center">
-                <div className="font-mono text-xl font-bold">17:34h</div>
-                <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
-                  Letzte Woche
-                </div>
-              </div>
-              <div className="p-4 text-center">
-                <div className="font-mono text-xl font-bold">22:56h</div>
-                <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
-                  Aktueller Monat
-                </div>
-              </div>
-              <div className="p-4 text-center">
-                <div className="font-mono text-xl font-bold">86:08h</div>
-                <div className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68]">
-                  Letzter Monat
-                </div>
+
+              {/* Collapse/Expand Bar Footer */}
+              <div className="border-t border-[#191918] bg-[#F4F1EA] px-4 py-1.5 flex items-center justify-end">
+                <button
+                  type="button"
+                  onClick={() => setShowKpiAverages((prev) => !prev)}
+                  className="font-mono text-[11px] uppercase tracking-wider text-[#6E6D68] hover:text-[#191918] flex items-center gap-1"
+                >
+                  {showKpiAverages ? (
+                    <>
+                      <ChevronUp className="w-3.5 h-3.5" /> Tagesdurchschnitte einklappen
+                    </>
+                  ) : (
+                    <>
+                      <ChevronDown className="w-3.5 h-3.5" /> Tagesdurchschnitte ausklappen (ø)
+                    </>
+                  )}
+                </button>
               </div>
             </div>
 
             {/* Daily Record Groups (Lemon Layout + Dieter Rams Grid) */}
             <div className="space-y-8">
-              {groupedRecords.map(([dateStr, dayRecords]) => {
-                const daySeconds = dayRecords.reduce((acc, r) => acc + getLiveSeconds(r), 0);
-                return (
-                  <section key={dateStr} className="space-y-4">
-                    {/* Day Divider Header with Circular Total Badge */}
-                    <div className="flex items-center gap-4">
-                      <div className="h-px bg-[#191918] flex-1" />
-                      <div className="flex items-center gap-3">
-                        <h2 className="text-base sm:text-lg font-medium tracking-tight">
-                          {formatGermanDateHeader(dateStr)}
-                        </h2>
-                        <div className="w-14 h-14 rounded-full bg-[#E6E1D6] border border-[#191918] flex items-center justify-center font-mono text-xs font-bold">
-                          {formatHM(daySeconds)}h
+              {groupedRecords.length === 0 ? (
+                <div className="bg-[#FAF8F5] border border-[#191918] p-8 text-center font-mono text-xs text-[#6E6D68] uppercase tracking-wider">
+                  Noch keine Zeiteinträge vorhanden. Starte oben einen Timer oder buche direkt über das Eingabefeld.
+                </div>
+              ) : (
+                groupedRecords.map(([dateStr, dayRecords]) => {
+                  const daySeconds = dayRecords.reduce((acc, r) => acc + getLiveSeconds(r), 0);
+                  return (
+                    <section key={dateStr} className="space-y-4">
+                      {/* Day Divider Header with Circular Total Badge */}
+                      <div className="flex items-center gap-4">
+                        <div className="h-px bg-[#191918] flex-1" />
+                        <div className="flex items-center gap-3">
+                          <h2 className="text-base sm:text-lg font-medium tracking-tight">
+                            {formatGermanDateHeader(dateStr)}
+                          </h2>
+                          <div className="w-14 h-14 rounded-full bg-[#E6E1D6] border border-[#191918] flex items-center justify-center font-mono text-xs font-bold">
+                            {formatHM(daySeconds)}h
+                          </div>
                         </div>
+                        <div className="h-px bg-[#191918] flex-1" />
                       </div>
-                      <div className="h-px bg-[#191918] flex-1" />
-                    </div>
 
-                    {/* Day Rows */}
-                    <div className="space-y-2.5">
-                      {dayRecords.map((rec) => {
-                        const proj =
-                          data.projects.find((p) => p.id === rec.projectId) || data.projects[0];
-                        const liveSec = getLiveSeconds(rec);
+                      {/* Day Rows */}
+                      <div className="space-y-2.5">
+                        {dayRecords.map((rec) => {
+                          const proj =
+                            data.projects.find((p) => p.id === rec.projectId) || data.projects[0];
+                          const liveSec = getLiveSeconds(rec);
+                          const isTagMenuOpen = openTagMenuRecordId === rec.id;
 
-                        return (
-                          <div
-                            key={rec.id}
-                            className={`grid grid-cols-1 md:grid-cols-12 border border-[#191918] bg-[#FAF8F5] transition-all ${
-                              rec.isRunning ? "ring-2 ring-[#E04F26]" : ""
-                            }`}
-                          >
-                            {/* Col 1: Colored Project Block */}
+                          return (
                             <div
-                              style={{
-                                backgroundColor: proj?.color || "#B8E986",
-                                color: proj?.textColor || "#191918",
-                              }}
-                              className="md:col-span-3 p-3.5 border-b md:border-b-0 md:border-r border-[#191918] flex items-center justify-between"
+                              key={rec.id}
+                              className={`grid grid-cols-1 md:grid-cols-12 border border-[#191918] bg-[#FAF8F5] transition-all ${
+                                rec.isRunning ? "ring-2 ring-[#E04F26]" : ""
+                              }`}
                             >
-                              <select
-                                value={rec.projectId}
-                                onChange={(e) =>
-                                  updateRecordField(rec.id, (r) => ({
-                                    ...r,
-                                    projectId: e.target.value,
-                                  }))
-                                }
+                              {/* Col 1: Colored Project Block */}
+                              <div
                                 style={{
-                                  backgroundColor: "transparent",
+                                  backgroundColor: proj?.color || "#B8E986",
                                   color: proj?.textColor || "#191918",
                                 }}
-                                className="font-semibold text-sm w-full focus:outline-none cursor-pointer"
+                                className="md:col-span-3 p-3.5 border-b md:border-b-0 md:border-r border-[#191918] flex items-center justify-between"
                               >
-                                {data.projects.map((p) => (
-                                  <option
-                                    key={p.id}
-                                    value={p.id}
-                                    className="bg-[#FAF8F5] text-[#191918]"
+                                <select
+                                  value={rec.projectId}
+                                  onChange={(e) =>
+                                    updateRecordField(rec.id, (r) => ({
+                                      ...r,
+                                      projectId: e.target.value,
+                                    }))
+                                  }
+                                  style={{
+                                    backgroundColor: "transparent",
+                                    color: proj?.textColor || "#191918",
+                                  }}
+                                  className="font-semibold text-sm w-full focus:outline-none cursor-pointer"
+                                >
+                                  {data.projects.map((p) => (
+                                    <option
+                                      key={p.id}
+                                      value={p.id}
+                                      className="bg-[#FAF8F5] text-[#191918]"
+                                    >
+                                      {p.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+
+                              {/* Col 2: Multi-Tags Cell */}
+                              <div className="relative md:col-span-3 p-2.5 border-b md:border-b-0 md:border-r border-[#191918] flex flex-wrap items-center gap-1.5">
+                                {rec.tags.map((t) => (
+                                  <span
+                                    key={t}
+                                    className="px-2 py-0.5 bg-[#F4F1EA] border border-[#191918] font-mono text-[11px] flex items-center gap-1"
                                   >
-                                    {p.name}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-
-                            {/* Col 2: Tags Cell */}
-                            <div className="md:col-span-2 p-3 border-b md:border-b-0 md:border-r border-[#191918] flex items-center">
-                              <select
-                                value={rec.tags[0] || ""}
-                                onChange={(e) => {
-                                  const val = e.target.value;
-                                  updateRecordField(rec.id, (r) => ({
-                                    ...r,
-                                    tags: val ? [val] : [],
-                                  }));
-                                }}
-                                className="w-full bg-transparent font-mono text-xs text-[#6E6D68] focus:text-[#191918] focus:outline-none cursor-pointer"
-                              >
-                                <option value="">+ add tags</option>
-                                {data.tags.map((t) => (
-                                  <option key={t} value={t}>
                                     #{t}
-                                  </option>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleTagOnRecord(rec.id, t)}
+                                      title={`Tag #${t} entfernen`}
+                                      className="text-[#6E6D68] hover:text-[#E04F26] font-bold"
+                                    >
+                                      ×
+                                    </button>
+                                  </span>
                                 ))}
-                              </select>
-                            </div>
 
-                            {/* Col 3: Description Input */}
-                            <div className="md:col-span-4 p-3 border-b md:border-b-0 md:border-r border-[#191918] flex items-center">
-                              <input
-                                type="text"
-                                value={rec.description}
-                                onChange={(e) =>
-                                  updateRecordField(rec.id, (r) => ({
-                                    ...r,
-                                    description: e.target.value,
-                                  }))
-                                }
-                                placeholder="✎ add description"
-                                className="w-full bg-transparent text-sm italic md:text-right focus:not-italic focus:outline-none placeholder:text-[#6E6D68]"
-                              />
-                            </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenTagMenuRecordId(isTagMenuOpen ? null : rec.id)
+                                  }
+                                  className="px-2 py-0.5 font-mono text-[11px] text-[#6E6D68] hover:text-[#191918] border border-dashed border-[#6E6D68] hover:border-[#191918] transition-colors"
+                                >
+                                  {rec.tags.length === 0 ? "+ add tags" : "+"}
+                                </button>
 
-                            {/* Col 4: Duration Display / Inline Edit */}
-                            <div className="md:col-span-2 p-3 border-b md:border-b-0 md:border-r border-[#191918] flex items-center justify-end font-mono text-lg font-medium">
-                              {editingDurationId === rec.id ? (
+                                {/* Multi-Tag Selector Popover */}
+                                {isTagMenuOpen && (
+                                  <div className="absolute left-0 top-full mt-1 w-64 bg-[#FAF8F5] border border-[#191918] z-30 p-3 shadow-md space-y-2.5">
+                                    <div className="flex items-center justify-between border-b border-[#D8D3C8] pb-1.5">
+                                      <span className="font-mono text-[10px] uppercase tracking-wider text-[#6E6D68]">
+                                        Tags auswählen (Mehrfachwahl)
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() => setOpenTagMenuRecordId(null)}
+                                        className="text-[#6E6D68] hover:text-[#191918]"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+
+                                    <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto">
+                                      {data.tags.map((tag) => {
+                                        const active = rec.tags.includes(tag);
+                                        return (
+                                          <button
+                                            key={tag}
+                                            type="button"
+                                            onClick={() => toggleTagOnRecord(rec.id, tag)}
+                                            className={`px-2 py-1 text-xs font-mono border border-[#191918] flex items-center gap-1 ${
+                                              active
+                                                ? "bg-[#191918] text-[#FAF8F5]"
+                                                : "bg-[#F4F1EA] text-[#191918] hover:bg-[#EAE5DC]"
+                                            }`}
+                                          >
+                                            {active && <Check className="w-3 h-3" />}#{tag}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+
+                                    <div className="flex gap-1 pt-1 border-t border-[#D8D3C8]">
+                                      <input
+                                        type="text"
+                                        value={inlineNewTagValue}
+                                        onChange={(e) => setInlineNewTagValue(e.target.value)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter") {
+                                            e.preventDefault();
+                                            addNewTagToRecord(rec.id, inlineNewTagValue);
+                                          }
+                                        }}
+                                        placeholder="Neuer Tag..."
+                                        className="flex-1 h-7 px-2 bg-[#F4F1EA] border border-[#191918] font-mono text-xs focus:outline-none"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          addNewTagToRecord(rec.id, inlineNewTagValue)
+                                        }
+                                        className="px-2.5 h-7 bg-[#191918] text-white font-mono text-xs uppercase"
+                                      >
+                                        +
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Col 3: Description Input */}
+                              <div className="md:col-span-3 p-3 border-b md:border-b-0 md:border-r border-[#191918] flex items-center">
                                 <input
                                   type="text"
-                                  autoFocus
-                                  value={editingDurationValue}
-                                  onChange={(e) => setEditingDurationValue(e.target.value)}
-                                  onBlur={() => {
-                                    const parsed = parseDurationString(editingDurationValue);
-                                    if (parsed !== null) {
-                                      updateRecordField(rec.id, (r) => ({
-                                        ...r,
-                                        seconds: parsed,
-                                      }));
-                                    }
-                                    setEditingDurationId(null);
-                                  }}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") {
+                                  value={rec.description}
+                                  onChange={(e) =>
+                                    updateRecordField(rec.id, (r) => ({
+                                      ...r,
+                                      description: e.target.value,
+                                    }))
+                                  }
+                                  placeholder="✎ add description"
+                                  className="w-full bg-transparent text-sm italic md:text-right focus:not-italic focus:outline-none placeholder:text-[#6E6D68]"
+                                />
+                              </div>
+
+                              {/* Col 4: Duration Display / Inline Edit */}
+                              <div className="md:col-span-2 p-3 border-b md:border-b-0 md:border-r border-[#191918] flex items-center justify-end font-mono text-lg font-medium">
+                                {editingDurationId === rec.id ? (
+                                  <input
+                                    type="text"
+                                    autoFocus
+                                    value={editingDurationValue}
+                                    onChange={(e) => setEditingDurationValue(e.target.value)}
+                                    onBlur={() => {
                                       const parsed = parseDurationString(editingDurationValue);
                                       if (parsed !== null) {
                                         updateRecordField(rec.id, (r) => ({
@@ -820,63 +1184,77 @@ export default function TimeTrackerApp() {
                                         }));
                                       }
                                       setEditingDurationId(null);
-                                    }
-                                  }}
-                                  className="w-24 text-right bg-[#F4F1EA] border border-[#191918] px-1.5 py-0.5 text-sm"
-                                />
-                              ) : (
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        const parsed = parseDurationString(editingDurationValue);
+                                        if (parsed !== null) {
+                                          updateRecordField(rec.id, (r) => ({
+                                            ...r,
+                                            seconds: parsed,
+                                          }));
+                                        }
+                                        setEditingDurationId(null);
+                                      }
+                                    }}
+                                    className="w-24 text-right bg-[#F4F1EA] border border-[#191918] px-1.5 py-0.5 text-sm"
+                                  />
+                                ) : (
+                                  <button
+                                    type="button"
+                                    title="Klicken zum Bearbeiten (z.B. 1:30)"
+                                    onClick={() => {
+                                      setEditingDurationId(rec.id);
+                                      setEditingDurationValue(formatHM(liveSec));
+                                    }}
+                                    className="hover:underline"
+                                  >
+                                    {rec.isRunning ? formatHMS(liveSec) : formatHM(liveSec)}
+                                  </button>
+                                )}
+                              </div>
+
+                              {/* Col 5: Action Buttons (Start/Stop + Delete) */}
+                              <div className="md:col-span-1 flex items-stretch">
                                 <button
                                   type="button"
-                                  title="Klicken zum Bearbeiten (z.B. 1:30)"
-                                  onClick={() => {
-                                    setEditingDurationId(rec.id);
-                                    setEditingDurationValue(formatHM(liveSec));
+                                  onClick={() => toggleRecordTimer(rec.id)}
+                                  style={{
+                                    backgroundColor: rec.isRunning
+                                      ? "#E04F26"
+                                      : proj?.color || "#B8E986",
+                                    color: rec.isRunning
+                                      ? "#FFFFFF"
+                                      : proj?.textColor || "#191918",
                                   }}
-                                  className="hover:underline"
+                                  title={
+                                    rec.isRunning ? "Timer stoppen" : "Timer starten / fortsetzen"
+                                  }
+                                  className="flex-1 py-3 flex items-center justify-center border-r border-[#191918] hover:opacity-90 transition-opacity"
                                 >
-                                  {rec.isRunning ? formatHMS(liveSec) : formatHM(liveSec)}
+                                  {rec.isRunning ? (
+                                    <Square className="w-4 h-4 fill-current" />
+                                  ) : (
+                                    <Play className="w-4 h-4 fill-current" />
+                                  )}
                                 </button>
-                              )}
+                                <button
+                                  type="button"
+                                  onClick={() => deleteRecord(rec.id)}
+                                  title="Eintrag löschen"
+                                  className="px-2.5 bg-[#FAF8F5] hover:bg-[#191918] hover:text-white flex items-center justify-center transition-colors"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
                             </div>
-
-                            {/* Col 5: Action Buttons (Start/Stop + Delete) */}
-                            <div className="md:col-span-1 flex items-stretch">
-                              <button
-                                type="button"
-                                onClick={() => toggleRecordTimer(rec.id)}
-                                style={{
-                                  backgroundColor: rec.isRunning
-                                    ? "#E04F26"
-                                    : proj?.color || "#B8E986",
-                                  color: rec.isRunning
-                                    ? "#FFFFFF"
-                                    : proj?.textColor || "#191918",
-                                }}
-                                title={rec.isRunning ? "Timer stoppen" : "Timer starten / fortsetzen"}
-                                className="flex-1 py-3 flex items-center justify-center border-r border-[#191918] hover:opacity-90 transition-opacity"
-                              >
-                                {rec.isRunning ? (
-                                  <Square className="w-4 h-4 fill-current" />
-                                ) : (
-                                  <Play className="w-4 h-4 fill-current" />
-                                )}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => deleteRecord(rec.id)}
-                                title="Eintrag löschen"
-                                className="px-2.5 bg-[#FAF8F5] hover:bg-[#191918] hover:text-white flex items-center justify-center transition-colors"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </section>
-                );
-              })}
+                          );
+                        })}
+                      </div>
+                    </section>
+                  );
+                })
+              )}
             </div>
           </div>
         )}
@@ -895,23 +1273,54 @@ export default function TimeTrackerApp() {
 
             {/* Filter Bar */}
             <div className="bg-[#FAF8F5] border border-[#191918] p-6 space-y-5">
-              <div className="flex flex-wrap gap-2">
-                {data.savedFilters.map((sf) => (
-                  <button
-                    key={sf.id}
-                    onClick={() => {
-                      setReportRange(sf.range);
-                      setReportProjectId(sf.projectId);
-                      setReportTag(sf.tag);
-                    }}
-                    className="px-3 py-1 text-xs font-mono border border-[#191918] bg-[#F4F1EA] hover:bg-[#191918] hover:text-white flex items-center gap-1.5"
-                  >
-                    <Bookmark className="w-3 h-3" />
-                    {sf.name}
-                  </button>
-                ))}
+              {/* Saved Filters List */}
+              <div className="space-y-2">
+                <div className="font-mono text-[10px] uppercase tracking-wider text-[#6E6D68]">
+                  Gespeicherte Filter (Saved Filters)
+                </div>
+                {data.savedFilters.length === 0 ? (
+                  <div className="font-mono text-xs text-[#6E6D68] italic">
+                    Noch keine eigenen Filter gespeichert.
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {data.savedFilters.map((sf) => {
+                      const isCurrent =
+                        reportRange === sf.range &&
+                        reportProjectId === sf.projectId &&
+                        reportTag === sf.tag;
+                      return (
+                        <div
+                          key={sf.id}
+                          onClick={() => {
+                            setReportRange(sf.range);
+                            setReportProjectId(sf.projectId);
+                            setReportTag(sf.tag);
+                          }}
+                          className={`px-3 py-1.5 text-xs font-mono border border-[#191918] cursor-pointer flex items-center gap-2 transition-colors ${
+                            isCurrent
+                              ? "bg-[#191918] text-[#FAF8F5]"
+                              : "bg-[#F4F1EA] text-[#191918] hover:bg-[#EAE5DC]"
+                          }`}
+                        >
+                          <Bookmark className="w-3 h-3" />
+                          <span>{sf.name}</span>
+                          <button
+                            type="button"
+                            onClick={(e) => handleDeleteSavedFilter(sf.id, e)}
+                            title="Gespeicherten Filter löschen"
+                            className="opacity-70 hover:opacity-100 ml-1 font-bold"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
+              {/* Filter Dropdowns */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="block font-mono text-[10px] uppercase tracking-wider text-[#6E6D68] mb-1">
@@ -922,9 +1331,11 @@ export default function TimeTrackerApp() {
                     onChange={(e) => setReportRange(e.target.value)}
                     className="w-full h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-xs"
                   >
-                    <option value="all">Alle Zeiträume</option>
-                    <option value="today">Heute</option>
-                    <option value="nov2026">November 2026</option>
+                    {REPORT_RANGES.map((rangeOpt) => (
+                      <option key={rangeOpt.value} value={rangeOpt.value}>
+                        {rangeOpt.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -937,7 +1348,7 @@ export default function TimeTrackerApp() {
                     onChange={(e) => setReportProjectId(e.target.value)}
                     className="w-full h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-xs"
                   >
-                    <option value="all">(Alle Projekte)</option>
+                    <option value="all">(all projects)</option>
                     {data.projects.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
@@ -955,7 +1366,7 @@ export default function TimeTrackerApp() {
                     onChange={(e) => setReportTag(e.target.value)}
                     className="w-full h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-xs"
                   >
-                    <option value="all">(Alle Tags)</option>
+                    <option value="all">(all tags)</option>
                     {data.tags.map((t) => (
                       <option key={t} value={t}>
                         #{t}
@@ -964,9 +1375,28 @@ export default function TimeTrackerApp() {
                   </select>
                 </div>
               </div>
+
+              {/* Save Filter Combination Bar */}
+              <div className="pt-3 border-t border-[#D8D3C8] flex flex-col sm:flex-row gap-2 items-stretch sm:items-center justify-between">
+                <input
+                  type="text"
+                  value={customFilterName}
+                  onChange={(e) => setCustomFilterName(e.target.value)}
+                  placeholder="Optionaler Name für Filterkombination (sonst automatisch benannt)"
+                  className="flex-1 h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-xs placeholder:text-[#6E6D68] focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveCurrentFilter}
+                  className="h-10 px-4 bg-[#191918] text-[#FAF8F5] hover:bg-[#E04F26] transition-colors font-mono text-xs uppercase tracking-wider flex items-center justify-center gap-2 border border-[#191918]"
+                >
+                  <Bookmark className="w-3.5 h-3.5" />
+                  <span>save these filters</span>
+                </button>
+              </div>
             </div>
 
-            {/* Records Total Header with Decimal Hours */}
+            {/* Records Total Header with Decimal Hours + CSV & PDF Export */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 bg-[#FAF8F5] border border-[#191918] p-4">
               <div className="flex items-center gap-3">
                 <span className="font-mono text-sm uppercase tracking-wider">
@@ -977,13 +1407,22 @@ export default function TimeTrackerApp() {
                 </span>
               </div>
 
-              <button
-                onClick={handleExportCSV}
-                className="px-4 py-2 bg-[#191918] text-[#FAF8F5] font-mono text-xs uppercase tracking-wider hover:bg-[#E04F26] transition-colors flex items-center gap-2"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Als CSV / Excel exportieren
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={handleExportCSV}
+                  className="px-4 py-2 bg-[#191918] text-[#FAF8F5] font-mono text-xs uppercase tracking-wider hover:bg-[#E04F26] transition-colors flex items-center gap-2 border border-[#191918]"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  CSV / Excel Export
+                </button>
+                <button
+                  onClick={handleExportPDF}
+                  className="px-4 py-2 bg-[#E04F26] text-white font-mono text-xs uppercase tracking-wider hover:bg-[#191918] transition-colors flex items-center gap-2 border border-[#191918]"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  Als PDF exportieren
+                </button>
+              </div>
             </div>
 
             {/* Report Table */}
@@ -1001,43 +1440,54 @@ export default function TimeTrackerApp() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#D8D3C8] text-sm">
-                  {filteredReportRecords.map((rec) => {
-                    const proj = data.projects.find((p) => p.id === rec.projectId);
-                    const sec = getLiveSeconds(rec);
-                    return (
-                      <tr key={rec.id} className="hover:bg-[#F4F1EA]">
-                        <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
-                          {formatShortDate(rec.date)}
-                        </td>
-                        <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs text-[#6E6D68]">
-                          {data.team}
-                        </td>
-                        <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
-                          {data.user}
-                        </td>
-                        <td className="p-3 border-r border-[#D8D3C8]">
-                          {proj && (
-                            <span
-                              style={{
-                                backgroundColor: proj.color,
-                                color: proj.textColor,
-                              }}
-                              className="px-2.5 py-1 text-xs font-medium border border-[#191918] inline-block"
-                            >
-                              {proj.name}
-                            </span>
-                          )}
-                        </td>
-                        <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
-                          {rec.tags.map((t) => `#${t}`).join(", ")}
-                        </td>
-                        <td className="p-3 border-r border-[#D8D3C8]">{rec.description}</td>
-                        <td className="p-3 text-right font-mono font-semibold">
-                          {formatHM(sec)}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {filteredReportRecords.length === 0 ? (
+                    <tr>
+                      <td
+                        colSpan={7}
+                        className="p-6 text-center font-mono text-xs text-[#6E6D68]"
+                      >
+                        Keine Einträge für die gewählte Filterkombination gefunden.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredReportRecords.map((rec) => {
+                      const proj = data.projects.find((p) => p.id === rec.projectId);
+                      const sec = getLiveSeconds(rec);
+                      return (
+                        <tr key={rec.id} className="hover:bg-[#F4F1EA]">
+                          <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
+                            {formatShortDate(rec.date)}
+                          </td>
+                          <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs text-[#6E6D68]">
+                            {data.team}
+                          </td>
+                          <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
+                            {data.user}
+                          </td>
+                          <td className="p-3 border-r border-[#D8D3C8]">
+                            {proj && (
+                              <span
+                                style={{
+                                  backgroundColor: proj.color,
+                                  color: proj.textColor,
+                                }}
+                                className="px-2.5 py-1 text-xs font-medium border border-[#191918] inline-block"
+                              >
+                                {proj.name}
+                              </span>
+                            )}
+                          </td>
+                          <td className="p-3 border-r border-[#D8D3C8] font-mono text-xs">
+                            {rec.tags.map((t) => `#${t}`).join(", ")}
+                          </td>
+                          <td className="p-3 border-r border-[#D8D3C8]">{rec.description}</td>
+                          <td className="p-3 text-right font-mono font-semibold">
+                            {formatHM(sec)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -1061,27 +1511,33 @@ export default function TimeTrackerApp() {
               <h3 className="font-mono text-xs uppercase tracking-widest border-b border-[#191918] pb-3">
                 Projekt-Verteilung (Project Usage)
               </h3>
-              <div className="space-y-3">
-                {projectStats.map((item) => (
-                  <div key={item.project.id} className="space-y-1">
-                    <div className="flex justify-between text-xs font-mono">
-                      <span className="font-semibold">{item.project.name}</span>
-                      <span>
-                        {formatHM(item.seconds)}h ({item.percentage.toFixed(1)}%)
-                      </span>
+              {projectStats.length === 0 ? (
+                <div className="font-mono text-xs text-[#6E6D68]">
+                  Noch keine Projektdaten gebucht.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {projectStats.map((item) => (
+                    <div key={item.project.id} className="space-y-1">
+                      <div className="flex justify-between text-xs font-mono">
+                        <span className="font-semibold">{item.project.name}</span>
+                        <span>
+                          {formatHM(item.seconds)}h ({item.percentage.toFixed(1)}%)
+                        </span>
+                      </div>
+                      <div className="w-full h-7 bg-[#F4F1EA] border border-[#191918] overflow-hidden">
+                        <div
+                          style={{
+                            width: `${Math.max(2, item.percentage)}%`,
+                            backgroundColor: item.project.color,
+                          }}
+                          className="h-full border-r border-[#191918]"
+                        />
+                      </div>
                     </div>
-                    <div className="w-full h-7 bg-[#F4F1EA] border border-[#191918] overflow-hidden">
-                      <div
-                        style={{
-                          width: `${Math.max(2, item.percentage)}%`,
-                          backgroundColor: item.project.color,
-                        }}
-                        className="h-full border-r border-[#191918]"
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Tag Usage Chart */}
@@ -1089,24 +1545,30 @@ export default function TimeTrackerApp() {
               <h3 className="font-mono text-xs uppercase tracking-widest border-b border-[#191918] pb-3">
                 Tag-Verteilung (Tag Usage)
               </h3>
-              <div className="space-y-3">
-                {tagStats.map((item) => (
-                  <div key={item.tag} className="space-y-1">
-                    <div className="flex justify-between text-xs font-mono">
-                      <span>{item.tag}</span>
-                      <span>
-                        {formatHM(item.seconds)}h ({item.percentage.toFixed(1)}%)
-                      </span>
+              {tagStats.length === 0 ? (
+                <div className="font-mono text-xs text-[#6E6D68]">
+                  Noch keine Tag-Daten gebucht.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {tagStats.map((item) => (
+                    <div key={item.tag} className="space-y-1">
+                      <div className="flex justify-between text-xs font-mono">
+                        <span>{item.tag}</span>
+                        <span>
+                          {formatHM(item.seconds)}h ({item.percentage.toFixed(1)}%)
+                        </span>
+                      </div>
+                      <div className="w-full h-6 bg-[#F4F1EA] border border-[#191918] overflow-hidden">
+                        <div
+                          style={{ width: `${Math.max(2, item.percentage)}%` }}
+                          className="h-full bg-[#191918]"
+                        />
+                      </div>
                     </div>
-                    <div className="w-full h-6 bg-[#F4F1EA] border border-[#191918] overflow-hidden">
-                      <div
-                        style={{ width: `${Math.max(2, item.percentage)}%` }}
-                        className="h-full bg-[#191918]"
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1114,6 +1576,52 @@ export default function TimeTrackerApp() {
         {/* ==================== TAB 4: PROJEKTE & DATEN ==================== */}
         {activeTab === "settings" && (
           <div className="space-y-8">
+            {/* Profile & Team Settings (for CSV & PDF Export) */}
+            <div className="bg-[#FAF8F5] border border-[#191918] p-6 space-y-6">
+              <h3 className="font-mono text-xs uppercase tracking-widest border-b border-[#191918] pb-3 flex items-center gap-2">
+                <User className="w-4 h-4" />
+                Profil & Team (für Reports, CSV- & PDF-Export)
+              </h3>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block font-mono text-[10px] uppercase tracking-wider text-[#6E6D68] mb-1">
+                    Username / Name
+                  </label>
+                  <input
+                    type="text"
+                    value={data.user}
+                    onChange={(e) =>
+                      setData((prev) => ({
+                        ...prev,
+                        user: e.target.value,
+                      }))
+                    }
+                    placeholder="z.B. niklas"
+                    className="w-full h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-sm focus:outline-none focus:bg-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-mono text-[10px] uppercase tracking-wider text-[#6E6D68] mb-1">
+                    Team / Organisation
+                  </label>
+                  <input
+                    type="text"
+                    value={data.team}
+                    onChange={(e) =>
+                      setData((prev) => ({
+                        ...prev,
+                        team: e.target.value,
+                      }))
+                    }
+                    placeholder="z.B. georg+georg"
+                    className="w-full h-10 px-3 bg-[#F4F1EA] border border-[#191918] font-mono text-sm focus:outline-none focus:bg-white"
+                  />
+                </div>
+              </div>
+            </div>
+
             {/* Manage Projects */}
             <div className="bg-[#FAF8F5] border border-[#191918] p-6 space-y-6">
               <h3 className="font-mono text-xs uppercase tracking-widest border-b border-[#191918] pb-3 flex items-center gap-2">
@@ -1256,17 +1764,17 @@ export default function TimeTrackerApp() {
               </div>
             </div>
 
-            {/* Backup & Reset */}
+            {/* Backup, Restore & Delete All Data */}
             <div className="bg-[#FAF8F5] border border-[#191918] p-6 space-y-4">
               <h3 className="font-mono text-xs uppercase tracking-widest border-b border-[#191918] pb-3">
-                Gerätewechsel: Lokaler Browser-Speicher Export & Import
+                Gerätewechsel & Datenverwaltung (LocalStorage)
               </h3>
               <p className="text-sm text-[#6E6D68]">
-                Alle Daten werden lokal im Browser (LocalStorage) gespeichert. Über JSON-Export und
-                JSON-Import kannst du deinen kompletten Stand jederzeit sichern oder auf ein anderes
-                Gerät umziehen.
+                Alle Daten werden lokal im Browser gespeichert. Über JSON-Export und JSON-Import
+                kannst du deinen kompletten Stand sichern, auf ein anderes Gerät umziehen oder hier
+                vollständig zurücksetzen.
               </p>
-              <div className="flex flex-wrap gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <button
                   type="button"
                   onClick={handleExportJSON}
@@ -1286,28 +1794,74 @@ export default function TimeTrackerApp() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (confirm("Möchtest du wirklich auf die Demo-Daten zurücksetzen?")) {
+                    if (confirm("Möchtest du wirklich auf die Standard-Projekte zurücksetzen?")) {
                       setData(INITIAL_DATA);
+                      setConfirmDeleteAll(false);
                     }
                   }}
-                  className="px-4 py-2.5 border border-[#191918] text-[#E04F26] font-mono text-xs uppercase tracking-wider flex items-center gap-2 ml-auto"
+                  className="px-4 py-2.5 border border-[#191918] bg-[#FAF8F5] hover:bg-[#EAE5DC] text-[#191918] font-mono text-xs uppercase tracking-wider flex items-center gap-2"
                 >
                   <RotateCcw className="w-4 h-4" />
-                  Demo-Daten wiederherstellen
+                  Standard-Daten laden
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteAll(true)}
+                  className="px-4 py-2.5 border border-[#191918] bg-[#E04F26] text-white hover:bg-[#191918] transition-colors font-mono text-xs uppercase tracking-wider flex items-center gap-2 ml-auto"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Alle Daten löschen
                 </button>
               </div>
+
+              {/* Explicit Confirmation Box before wiping all data */}
+              {confirmDeleteAll && (
+                <div className="mt-4 p-4 border-2 border-[#E04F26] bg-[#F4F1EA] space-y-3">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-5 h-5 text-[#E04F26] shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <div className="font-mono text-xs font-bold uppercase tracking-wider text-[#191918]">
+                        Sicherheitsabfrage: Wirklich alle Daten unwiderruflich löschen?
+                      </div>
+                      <p className="text-xs text-[#6E6D68]">
+                        Dadurch werden sämtliche Zeiteinträge, Projekte, Tags und gespeicherten Filter
+                        aus deinem Browser-Speicher gelöscht.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2 justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteAll(false)}
+                      className="px-3 py-1.5 border border-[#191918] bg-[#FAF8F5] font-mono text-xs uppercase tracking-wider"
+                    >
+                      Abbrechen
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextEmpty: AppData = {
+                          ...EMPTY_DATA,
+                          user: data.user,
+                          team: data.team,
+                        };
+                        setData(nextEmpty);
+                        setSelectedProjectId("");
+                        setSelectedTags([]);
+                        setConfirmDeleteAll(false);
+                      }}
+                      className="px-3 py-1.5 border border-[#191918] bg-[#E04F26] text-white font-mono text-xs uppercase tracking-wider font-semibold hover:bg-[#191918]"
+                    >
+                      Ja, alle Daten endgültig löschen
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
       </main>
-
-      {/* DIETER RAMS MINIMAL FOOTER */}
-      <footer className="border-t border-[#191918] bg-[#FAF8F5] py-4 px-6 mt-12">
-        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between text-xs font-mono text-[#6E6D68] gap-2">
-          <div>ZEIT // SYSTEM RAMS-01 • LOKALER BROWSER-SPEICHER AKTIV</div>
-          <div>zeit.niklasfritsch.de • PORT 8080 (DOCKER STANDALONE)</div>
-        </div>
-      </footer>
     </div>
   );
 }

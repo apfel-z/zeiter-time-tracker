@@ -48,10 +48,28 @@ export const PASTEL_PALETTE = [
   { name: "Graphit-Dunkel", color: "#2B2D42", textColor: "#FAF8F5" },
 ];
 
+export function getRandomPastelSwatch(existingProjects: Project[] = []) {
+  const usedColors = new Set(existingProjects.map((p) => p.color.toUpperCase()));
+  const available = PASTEL_PALETTE.filter((s) => !usedColors.has(s.color.toUpperCase()));
+  const pool = available.length > 0 ? available : PASTEL_PALETTE;
+  const randomIndex = Math.floor(Math.random() * pool.length);
+  return pool[randomIndex];
+}
+
+export const EMPTY_DATA: AppData = {
+  version: "2.1.0",
+  user: "",
+  team: "",
+  projects: [],
+  tags: [],
+  records: [],
+  savedFilters: [],
+};
+
 export const INITIAL_DATA: AppData = {
-  version: "2.0.0",
-  user: "Demo User",
-  team: "Example Team",
+  version: "2.1.0",
+  user: "niklas",
+  team: "georg+georg",
   projects: [
     { id: "p1", name: "Website Redesign", color: "#B8E986", textColor: "#191918" },
     { id: "p2", name: "Mobile App", color: "#7CE0A6", textColor: "#191918" },
@@ -59,73 +77,12 @@ export const INITIAL_DATA: AppData = {
     { id: "p4", name: "Team Operations", color: "#C5A3FF", textColor: "#191918" },
   ],
   tags: ["design", "development", "meeting", "research", "admin", "review"],
-  records: [
-    {
-      id: "r1",
-      date: "2026-11-11",
-      projectId: "p1",
-      tags: ["design"],
-      description: "Homepage wireframe",
-      seconds: 7200,
-      isRunning: false,
-      startedAt: null,
-    },
-    {
-      id: "r2",
-      date: "2026-11-11",
-      projectId: "p2",
-      tags: ["development"],
-      description: "Build navigation component",
-      seconds: 5400,
-      isRunning: false,
-      startedAt: null,
-    },
-    {
-      id: "r3",
-      date: "2026-11-10",
-      projectId: "p1",
-      tags: ["meeting"],
-      description: "Project kick-off",
-      seconds: 2700,
-      isRunning: false,
-      startedAt: null,
-    },
-    {
-      id: "r4",
-      date: "2026-11-10",
-      projectId: "p3",
-      tags: ["research"],
-      description: "Competitor review",
-      seconds: 4500,
-      isRunning: false,
-      startedAt: null,
-    },
-    {
-      id: "r5",
-      date: "2026-11-09",
-      projectId: "p2",
-      tags: ["development"],
-      description: "Implement responsive layout",
-      seconds: 9000,
-      isRunning: false,
-      startedAt: null,
-    },
-    {
-      id: "r6",
-      date: "2026-11-09",
-      projectId: "p4",
-      tags: ["admin"],
-      description: "Weekly planning",
-      seconds: 1800,
-      isRunning: false,
-      startedAt: null,
-    },
-  ],
+  records: [],
   savedFilters: [
     {
       id: "sf1",
-      name: "This week • All projects",
-      range: "week",
+      name: "this month • Alle Projekte • Alle Tags",
+      range: "this_month",
       projectId: "all",
       tag: "all",
     },
